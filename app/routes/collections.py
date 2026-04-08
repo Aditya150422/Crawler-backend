@@ -1,7 +1,7 @@
 """
 Collection routes for managing scraped website collections.
 """
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status, Depends
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
@@ -11,9 +11,18 @@ from app.crawler import crawl_sync
 from app import vector_store
 from app import job_store
 from app import collection_store
+from app import learning_node_summary_store
 from app.socketio_manager import emit_job_update_sync, emit_collection_update_sync, emit_progress_sync
+from app.crawler import handle_chunk
+from app.llm_service import generate_learning_path
+from app.models.collection import GenerateLearningPathRequest, LearningPathResponse
+from app.auth import get_current_user
+import asyncio
+from app.redis_client import cache_get_json, cache_set_json, cache_delete, publish_event
 
 router = APIRouter(prefix="/collections", tags=["collections"])
+
+CRAWL_LOG_STORE_LIMIT = 5000
 
 
 class CreateCollectionRequest(BaseModel):
@@ -26,6 +35,24 @@ class CreateCollectionRequest(BaseModel):
 
 class UpdateCollectionRequest(BaseModel):
     name: Optional[str] = None
+
+
+def _current_user_id(current_user: dict) -> str:
+    return str(current_user["_id"])
+
+
+def _ensure_collection_owner(collection: Optional[dict], user_id: str) -> dict:
+    if not collection:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collection not found"
+        )
+    if collection.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this collection"
+        )
+    return collection
 
 
 def run_collection_scrape_job(job_id: str, collection_id: str, req: CreateCollectionRequest):
@@ -43,50 +70,116 @@ def run_collection_scrape_job(job_id: str, collection_id: str, req: CreateCollec
         def crawl_progress(current: int, total: int, message: str):
             emit_progress_sync(job_id, current, total, message, stage="crawling")
         
-        # Run the crawler with progress
-        data = crawl_sync(req.url, req.max_pages, req.max_depth, progress_callback=crawl_progress)
+        # Run crawler and capture route-level crawl report
+        crawl_report = crawl_sync(
+            req.url,
+            req.max_pages,
+            req.max_depth,
+            progress_callback=crawl_progress,
+            include_report=True,
+        )
+
+        if isinstance(crawl_report, dict):
+            data = crawl_report.get("pages", [])
+            crawled_routes = crawl_report.get("crawled_routes", [])
+            not_crawled_routes = crawl_report.get("not_crawled_routes", [])
+            crawl_logs = crawl_report.get("crawl_logs", [])
+            crawl_summary = crawl_report.get("summary", {})
+        else:
+            data = crawl_report
+            crawled_routes = [page.get("url", "") for page in data if page.get("url")]
+            not_crawled_routes = []
+            crawl_logs = []
+            crawl_summary = {}
+
+        if len(crawl_logs) > CRAWL_LOG_STORE_LIMIT:
+            crawl_logs = crawl_logs[-CRAWL_LOG_STORE_LIMIT:]
+
+        routes_crawled_count = len(crawled_routes)
+        routes_not_crawled_count = len(not_crawled_routes)
+        crawl_logs_count = len(crawl_logs)
         
         # Update status to embedding
-        job_store.update_job_sync(job_id, {"status": "embedding", "pages_crawled": len(data)})
-        collection_store.update_collection_sync(collection_id, {"status": "embedding"})
+        job_store.update_job_sync(job_id, {
+            "status": "embedding",
+            "pages_crawled": len(data),
+            "routes_crawled": crawled_routes,
+            "routes_not_crawled": not_crawled_routes,
+            "routes_crawled_count": routes_crawled_count,
+            "routes_not_crawled_count": routes_not_crawled_count,
+            "crawl_logs": crawl_logs,
+            "crawl_logs_count": crawl_logs_count,
+            "crawl_summary": crawl_summary,
+        })
+        collection_store.update_collection_sync(collection_id, {
+            "status": "embedding",
+            "routes_crawled_count": routes_crawled_count,
+            "routes_not_crawled_count": routes_not_crawled_count,
+        })
         
         emit_job_update_sync(job_id, {
             "status": "embedding",
             "pages_crawled": len(data),
-            "message": f"Crawled {len(data)} pages. Creating embeddings..."
+            "routes_crawled_count": routes_crawled_count,
+            "routes_not_crawled_count": routes_not_crawled_count,
+            "crawl_logs_count": crawl_logs_count,
+            "message": (
+                f"Crawled {routes_crawled_count} route(s). "
+                f"Not crawled: {routes_not_crawled_count}. Creating embeddings..."
+            ),
         })
-        emit_collection_update_sync(collection_id, {"status": "embedding", "pages_count": len(data)})
+        emit_collection_update_sync(collection_id, {
+            "status": "embedding",
+            "pages_count": len(data),
+            "routes_crawled_count": routes_crawled_count,
+            "routes_not_crawled_count": routes_not_crawled_count,
+        })
         
         # Progress callback for embedding
         def embed_progress(current: int, total: int, message: str):
             emit_progress_sync(job_id, current, total, message, stage="embedding")
         
-        # Store in vector database using collection name with progress
-        pages_stored = vector_store.store_pages(data, req.name, progress_callback=embed_progress)
-        
+        # Store in vector database using collection name with progress and creation of questionnaire
+        pages_stored = vector_store.store_pages(data, req.name, progress_callback=embed_progress, chunk_callback=lambda chunk, metadata:
+        handle_chunk(chunk, metadata, collection_id))
+
         # Update job as completed
         job_store.update_job_sync(job_id, {
             "status": "completed",
             "pages_stored": pages_stored,
             "collection_name": req.name,
-            "results_count": len(data)
+            "results_count": len(data),
+            "routes_crawled": crawled_routes,
+            "routes_not_crawled": not_crawled_routes,
+            "routes_crawled_count": routes_crawled_count,
+            "routes_not_crawled_count": routes_not_crawled_count,
+            "crawl_logs": crawl_logs,
+            "crawl_logs_count": crawl_logs_count,
+            "crawl_summary": crawl_summary,
         })
         
         # Update collection as completed
         collection_store.update_collection_sync(collection_id, {
             "status": "completed",
-            "pages_count": pages_stored
+            "pages_count": pages_stored,
+            "routes_crawled_count": routes_crawled_count,
+            "routes_not_crawled_count": routes_not_crawled_count,
         })
         
         emit_job_update_sync(job_id, {
             "status": "completed",
             "pages_stored": pages_stored,
+            "routes_crawled_count": routes_crawled_count,
+            "routes_not_crawled_count": routes_not_crawled_count,
+            "crawl_logs_count": crawl_logs_count,
             "percentage": 100,
             "message": f"Successfully stored {pages_stored} chunks. Ready to chat!"
         })
         emit_collection_update_sync(collection_id, {
             "status": "completed",
-            "pages_count": pages_stored
+            "pages_count": pages_stored,
+            "routes_crawled_count": routes_crawled_count,
+            "routes_not_crawled_count": routes_not_crawled_count,
         })
         
     except Exception as e:
@@ -106,7 +199,8 @@ def run_collection_scrape_job(job_id: str, collection_id: str, req: CreateCollec
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_collection(
     req: CreateCollectionRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Create a new collection and start scraping the website.
@@ -120,6 +214,8 @@ async def create_collection(
             detail=f"Collection '{req.name}' already exists"
         )
     
+    user_id = _current_user_id(current_user)
+
     collection_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat()
@@ -131,13 +227,22 @@ async def create_collection(
         "url": req.url,
         "status": "pending",
         "pages_count": 0,
+        "routes_crawled_count": 0,
+        "routes_not_crawled_count": 0,
         "job_id": job_id,
-        "user_id": req.user_id,
+        "user_id": user_id,
         "chat_sessions": [],
         "created_at": now,
         "updated_at": now
     }
     await collection_store.create_collection(collection_data)
+    await cache_delete(
+        "collections:all",
+        f"collections:user:{user_id}",
+        f"collection:name:{req.name}",
+        f"collection:name:{req.name}:user:{user_id}",
+    )
+    await publish_event("collections.updated", {"collection_id": collection_id, "updates": {"status": "pending"}})
     
     # Create associated job
     job_data = {
@@ -149,6 +254,12 @@ async def create_collection(
         "collection_id": collection_id,
         "status": "pending",
         "pages_stored": 0,
+        "routes_crawled": [],
+        "routes_not_crawled": [],
+        "routes_crawled_count": 0,
+        "routes_not_crawled_count": 0,
+        "crawl_logs": [],
+        "crawl_logs_count": 0,
         "created_at": now,
         "updated_at": now
     }
@@ -168,21 +279,31 @@ async def create_collection(
 
 
 @router.get("/")
-async def list_collections(user_id: Optional[str] = None):
-    """List all collections, optionally filtered by user."""
-    collections = await collection_store.get_all_collections(user_id)
-    return {"collections": collections, "count": len(collections)}
+async def list_collections(current_user: dict = Depends(get_current_user)):
+    """List collections for the authenticated user."""
+    current_user_id = _current_user_id(current_user)
+    cache_key = f"collections:user:{current_user_id}"
+    cached = await cache_get_json(cache_key)
+    if cached:
+        return cached
+
+    collections = await collection_store.get_all_collections(current_user_id)
+    payload = {"collections": collections, "count": len(collections)}
+    await cache_set_json(cache_key, payload, ttl_seconds=60)
+    return payload
 
 
 @router.get("/{collection_id}")
-async def get_collection(collection_id: str):
+async def get_collection(collection_id: str, current_user: dict = Depends(get_current_user)):
     """Get a specific collection with its details."""
+    current_user_id = _current_user_id(current_user)
+    cache_key = f"collection:id:{collection_id}:user:{current_user_id}"
+    cached = await cache_get_json(cache_key)
+    if cached:
+        return cached
+
     collection = await collection_store.get_collection_by_id(collection_id)
-    if not collection:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Collection not found"
-        )
+    collection = _ensure_collection_owner(collection, current_user_id)
     
     # Get vector store stats
     try:
@@ -191,23 +312,31 @@ async def get_collection(collection_id: str):
     except:
         collection["vector_stats"] = None
     
+    await cache_set_json(cache_key, collection, ttl_seconds=60)
     return collection
 
 
 @router.get("/name/{name}")
-async def get_collection_by_name(name: str):
+async def get_collection_by_name(name: str, current_user: dict = Depends(get_current_user)):
     """Get a collection by its name."""
+    current_user_id = _current_user_id(current_user)
+    cache_key = f"collection:name:{name}:user:{current_user_id}"
+    cached = await cache_get_json(cache_key)
+    if cached:
+        return cached
+
     collection = await collection_store.get_collection_by_name(name)
-    if not collection:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Collection not found"
-        )
+    collection = _ensure_collection_owner(collection, current_user_id)
+    await cache_set_json(cache_key, collection, ttl_seconds=60)
     return collection
 
 
 @router.patch("/{collection_id}")
-async def update_collection(collection_id: str, req: UpdateCollectionRequest):
+async def update_collection(
+    collection_id: str,
+    req: UpdateCollectionRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """Update collection metadata."""
     updates = {k: v for k, v in req.dict().items() if v is not None}
     
@@ -217,25 +346,33 @@ async def update_collection(collection_id: str, req: UpdateCollectionRequest):
             detail="No updates provided"
         )
     
+    current_user_id = _current_user_id(current_user)
+    existing = await collection_store.get_collection_by_id(collection_id)
+    _ensure_collection_owner(existing, current_user_id)
+
     collection = await collection_store.update_collection(collection_id, updates)
     if not collection:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Collection not found"
         )
-    
+    await cache_delete(
+        "collections:all",
+        f"collections:user:{current_user_id}",
+        f"collection:id:{collection_id}:user:{current_user_id}",
+        f"collection:name:{collection.get('name')}",
+        f"collection:name:{collection.get('name')}:user:{current_user_id}",
+    )
+    await publish_event("collections.updated", {"collection_id": collection_id, "updates": updates})
     return collection
 
 
 @router.delete("/{collection_id}")
-async def delete_collection(collection_id: str):
+async def delete_collection(collection_id: str, current_user: dict = Depends(get_current_user)):
     """Delete a collection and its associated data."""
+    current_user_id = _current_user_id(current_user)
     collection = await collection_store.get_collection_by_id(collection_id)
-    if not collection:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Collection not found"
-        )
+    collection = _ensure_collection_owner(collection, current_user_id)
     
     # Delete from vector store
     try:
@@ -249,19 +386,24 @@ async def delete_collection(collection_id: str):
     
     # Delete collection
     await collection_store.delete_collection(collection_id)
+    await cache_delete(
+        "collections:all",
+        f"collections:user:{current_user_id}",
+        f"collection:id:{collection_id}:user:{current_user_id}",
+        f"collection:name:{collection.get('name')}",
+        f"collection:name:{collection.get('name')}:user:{current_user_id}",
+    )
+    await publish_event("collections.updated", {"collection_id": collection_id, "deleted": True})
     
     return {"message": "Collection deleted", "collection_id": collection_id}
 
 
 @router.get("/{collection_id}/job")
-async def get_collection_job(collection_id: str):
+async def get_collection_job(collection_id: str, current_user: dict = Depends(get_current_user)):
     """Get the scraping job associated with a collection."""
+    current_user_id = _current_user_id(current_user)
     collection = await collection_store.get_collection_by_id(collection_id)
-    if not collection:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Collection not found"
-        )
+    collection = _ensure_collection_owner(collection, current_user_id)
     
     job_id = collection.get("job_id")
     if not job_id:
@@ -278,3 +420,278 @@ async def get_collection_job(collection_id: str):
         )
     
     return job
+
+
+@router.get("/{collection_id}/routes")
+async def get_collection_routes(collection_id: str, current_user: dict = Depends(get_current_user)):
+    """Get crawled and not-crawled routes for a collection."""
+    current_user_id = _current_user_id(current_user)
+    collection = await collection_store.get_collection_by_id(collection_id)
+    collection = _ensure_collection_owner(collection, current_user_id)
+
+    job_id = collection.get("job_id")
+    if not job_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No job associated with this collection"
+        )
+
+    job = await job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found"
+        )
+
+    routes_crawled = job.get("routes_crawled", [])
+    routes_not_crawled = job.get("routes_not_crawled", [])
+
+    return {
+        "collection_id": collection_id,
+        "job_id": job_id,
+        "routes_crawled_count": job.get("routes_crawled_count", len(routes_crawled)),
+        "routes_not_crawled_count": job.get("routes_not_crawled_count", len(routes_not_crawled)),
+        "routes_crawled": routes_crawled,
+        "routes_not_crawled": routes_not_crawled,
+        "crawl_summary": job.get("crawl_summary", {}),
+    }
+
+
+@router.get("/{collection_id}/crawl-logs")
+async def get_collection_crawl_logs(
+    collection_id: str,
+    limit: int = Query(200, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get crawl logs for a collection job (including crawled and skipped endpoints)."""
+    current_user_id = _current_user_id(current_user)
+    collection = await collection_store.get_collection_by_id(collection_id)
+    collection = _ensure_collection_owner(collection, current_user_id)
+
+    job_id = collection.get("job_id")
+    if not job_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No job associated with this collection"
+        )
+
+    job = await job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found"
+        )
+
+    logs = job.get("crawl_logs", [])
+    sliced_logs = logs[offset:offset + limit]
+
+    return {
+        "collection_id": collection_id,
+        "job_id": job_id,
+        "crawl_logs_count": job.get("crawl_logs_count", len(logs)),
+        "offset": offset,
+        "limit": limit,
+        "logs": sliced_logs,
+    }
+
+
+@router.post("/learning-path", response_model=LearningPathResponse)
+async def generate_learning_path_from_urls(req: GenerateLearningPathRequest):
+    """
+    Generate a structured learning path from a list of URLs.
+    
+    Takes a list of URLs (typically from a sitemap) and uses AI to:
+    - Identify main learning topics
+    - Group related URLs into concepts/modules
+    - Infer prerequisite relationships
+    - Organize topics from beginner to advanced
+    
+    Returns a directed acyclic graph (DAG) representing the learning path.
+    """
+    if not req.urls:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="URLs list cannot be empty"
+        )
+    
+    if len(req.urls) > 500:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Maximum 500 URLs allowed per request"
+        )
+    
+    try:
+        result = generate_learning_path(req.urls)
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate learning path: {str(e)}"
+        )
+
+
+@router.post("/{collection_id}/learning-path", response_model=LearningPathResponse)
+async def generate_learning_path_for_collection(
+    collection_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Generate a structured learning path from a collection's crawled URLs.
+    
+    Uses the URLs that were crawled during the collection's scraping job
+    to generate a learning path.
+    """
+    current_user_id = _current_user_id(current_user)
+    collection = await collection_store.get_collection_by_id(collection_id)
+    collection = _ensure_collection_owner(collection, current_user_id)
+    
+    job_id = collection.get("job_id")
+    if not job_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No job associated with this collection"
+        )
+    
+    job = await job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found"
+        )
+    
+    routes_crawled = job.get("routes_crawled", [])
+    if not routes_crawled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No crawled URLs found for this collection"
+        )
+    
+    try:
+        result = generate_learning_path(routes_crawled)
+        await learning_node_summary_store.replace_collection_node_summaries(
+            collection_id=collection_id,
+            nodes=result.get("nodes", []),
+        )
+        await collection_store.update_collection(collection_id, {
+            "learning_path_graph": result,
+            "learning_path_generated_at": datetime.utcnow().isoformat(),
+        })
+        await cache_delete(
+            "collections:all",
+            f"collections:user:{current_user_id}",
+            f"collection:id:{collection_id}:user:{current_user_id}",
+            f"collection:name:{collection.get('name')}",
+            f"collection:name:{collection.get('name')}:user:{current_user_id}",
+        )
+        await publish_event(
+            "collections.updated",
+            {
+                "collection_id": collection_id,
+                "updates": {
+                    "learning_path_generated_at": datetime.utcnow().isoformat(),
+                },
+            },
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=str(e)
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate learning path: {str(e)}"
+        )
+
+
+@router.get("/{collection_id}/learning-path", response_model=LearningPathResponse)
+async def get_learning_path_for_collection(
+    collection_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Get the latest generated learning path graph for a collection.
+    """
+    current_user_id = _current_user_id(current_user)
+    collection = await collection_store.get_collection_by_id(collection_id)
+    collection = _ensure_collection_owner(collection, current_user_id)
+
+    learning_path_graph = collection.get("learning_path_graph")
+    if not learning_path_graph:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Learning path not generated yet. Call POST /collections/{collection_id}/learning-path first."
+        )
+
+    return learning_path_graph
+
+
+@router.get("/{collection_id}/learning-path/summaries")
+async def get_learning_path_summaries_for_collection(
+    collection_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Get persisted learning-node summaries for a collection."""
+    current_user_id = _current_user_id(current_user)
+    collection = await collection_store.get_collection_by_id(collection_id)
+    _ensure_collection_owner(collection, current_user_id)
+
+    summaries = await learning_node_summary_store.get_collection_node_summaries(collection_id)
+    return {
+        "collection_id": collection_id,
+        "count": len(summaries),
+        "summaries": summaries,
+    }
+
+
+@router.get("/{collection_id}/learning-path/nodes/{node_id}/summary")
+async def get_learning_path_node_summary(
+    collection_id: str,
+    node_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Get the summary for a single learning-path node.
+    Use this endpoint when a user clicks a node in the frontend.
+    """
+    current_user_id = _current_user_id(current_user)
+    collection = await collection_store.get_collection_by_id(collection_id)
+    collection = _ensure_collection_owner(collection, current_user_id)
+
+    summary_doc = await learning_node_summary_store.get_collection_node_summary(collection_id, node_id)
+    if summary_doc:
+        return {
+            "collection_id": collection_id,
+            "node_id": node_id,
+            "node_label": summary_doc.get("node_label", ""),
+            "summary": summary_doc.get("summary", ""),
+            "difficulty": summary_doc.get("difficulty"),
+            "module": summary_doc.get("module"),
+            "type": summary_doc.get("node_type"),
+        }
+
+    # Fallback: try stored graph if summary collection has not been populated yet
+    graph = collection.get("learning_path_graph", {})
+    for node in graph.get("nodes", []):
+        if node.get("id") == node_id and node.get("summary"):
+            return {
+                "collection_id": collection_id,
+                "node_id": node_id,
+                "node_label": node.get("label", ""),
+                "summary": node.get("summary", ""),
+                "difficulty": node.get("difficulty"),
+                "module": node.get("module"),
+                "type": node.get("type"),
+            }
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Summary not found for node '{node_id}'"
+    )

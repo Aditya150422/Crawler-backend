@@ -3,9 +3,12 @@ Collection storage service using MongoDB.
 Manages collections and their associated chat histories.
 """
 import json
+import os
 from datetime import datetime
 from typing import Optional, List, Dict
 import uuid
+
+from app.redis_client import cache_delete_sync, publish_event_sync
 
 
 async def create_collection(collection_data: dict) -> dict:
@@ -81,6 +84,11 @@ def update_collection_sync(collection_id: str, updates: dict) -> bool:
             {"id": collection_id},
             {"$set": updates}
         )
+        keys = ["collections:all", f"collection:id:{collection_id}"]
+        if "name" in updates and updates["name"]:
+            keys.append(f"collection:name:{updates['name']}")
+        cache_delete_sync(*keys)
+        publish_event_sync("collections.updated", {"collection_id": collection_id, "updates": updates})
         sync_client.close()
         return True
     except Exception as e:

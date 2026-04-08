@@ -2,18 +2,32 @@
 Chat routes for collection-based conversations.
 Uses Socket.IO for real-time messaging and HTTP endpoints for REST API.
 """
-from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, status, Depends
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
 import uuid
+import asyncio
+import re
 
 from app import collection_store
 from app import vector_store
 from app import llm_service
+from app.auth import get_current_user
+
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-
+WEBSITE_CONTEXT_LIMIT = 12000
+CHAT_HISTORY_LIMIT = 8
+FOLLOW_UP_PATTERNS = [
+    r"\bmore info\b",
+    r"\btell me more\b",
+    r"\bmore details\b",
+    r"\belaborate\b",
+    r"\bcontinue\b",
+    r"\bexpand\b",
+    r"\bcan you explain more\b",
+]
 
 class CreateSessionRequest(BaseModel):
     collection_id: str
@@ -29,7 +43,7 @@ class MessageResponse(BaseModel):
     id: str
     role: str
     content: str
-    sources: List[dict] = []
+    sources: List[dict] = Field(default_factory=list)
     created_at: str
 
 
@@ -37,23 +51,70 @@ class SessionResponse(BaseModel):
     id: str
     collection_id: str
     title: Optional[str]
-    messages: List[dict]
+    messages: List[dict] = Field(default_factory=list)
     created_at: str
     updated_at: str
 
 
-# Session Management Endpoints
+def _current_user_id(current_user: dict) -> str:
+    return str(current_user["_id"])
 
-@router.post("/sessions", status_code=status.HTTP_201_CREATED)
-async def create_session(req: CreateSessionRequest):
-    """Create a new chat session for a collection."""
-    # Verify collection exists
-    collection = await collection_store.get_collection_by_id(req.collection_id)
+
+def _ensure_collection_owner(collection: Optional[dict], user_id: str) -> dict:
     if not collection:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Collection not found"
         )
+    if collection.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have access to this collection"
+        )
+    return collection
+
+
+def _is_follow_up_message(message: str) -> bool:
+    text = (message or "").strip().lower()
+    if not text:
+        return False
+    return any(re.search(pattern, text) for pattern in FOLLOW_UP_PATTERNS)
+
+
+def _infer_topic_from_session(messages: List[dict]) -> Optional[str]:
+    """
+    Infer the active topic from the latest non-follow-up user message.
+    """
+    for msg in reversed(messages or []):
+        if msg.get("role") != "user":
+            continue
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        if _is_follow_up_message(content):
+            continue
+        return content
+    return None
+
+
+def _resolve_retrieval_query(message: str, session_messages: List[dict]) -> str:
+    """
+    Resolve ambiguous follow-ups to the previous topic for vector retrieval.
+    """
+    if not _is_follow_up_message(message):
+        return message
+    topic = _infer_topic_from_session(session_messages)
+    if not topic:
+        return message
+    return f"{message.strip()} about: {topic}"
+
+
+@router.post("/sessions", status_code=status.HTTP_201_CREATED)
+async def create_session(req: CreateSessionRequest, current_user: dict = Depends(get_current_user)):
+    """Create a new chat session for a collection."""
+    # Verify collection exists
+    collection = await collection_store.get_collection_by_id(req.collection_id)
+    _ensure_collection_owner(collection, _current_user_id(current_user))
     
     session_id = str(uuid.uuid4())
     session_data = {
@@ -71,22 +132,25 @@ async def create_session(req: CreateSessionRequest):
 
 
 @router.get("/sessions/{collection_id}")
-async def get_sessions(collection_id: str):
+async def get_sessions(collection_id: str, current_user: dict = Depends(get_current_user)):
     """Get all chat sessions for a collection."""
     collection = await collection_store.get_collection_by_id(collection_id)
-    if not collection:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Collection not found"
-        )
+    _ensure_collection_owner(collection, _current_user_id(current_user))
     
     sessions = await collection_store.get_all_chat_sessions(collection_id)
     return {"collection_id": collection_id, "sessions": sessions}
 
 
 @router.get("/session/{collection_id}/{session_id}")
-async def get_session(collection_id: str, session_id: str):
+async def get_session(
+    collection_id: str,
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """Get a specific chat session with all messages."""
+    collection = await collection_store.get_collection_by_id(collection_id)
+    _ensure_collection_owner(collection, _current_user_id(current_user))
+
     session = await collection_store.get_chat_session(collection_id, session_id)
     if not session:
         raise HTTPException(
@@ -98,8 +162,15 @@ async def get_session(collection_id: str, session_id: str):
 
 
 @router.delete("/session/{collection_id}/{session_id}")
-async def delete_session(collection_id: str, session_id: str):
+async def delete_session(
+    collection_id: str,
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """Delete a chat session."""
+    collection = await collection_store.get_collection_by_id(collection_id)
+    _ensure_collection_owner(collection, _current_user_id(current_user))
+
     deleted = await collection_store.delete_chat_session(collection_id, session_id)
     if not deleted:
         raise HTTPException(
@@ -110,27 +181,20 @@ async def delete_session(collection_id: str, session_id: str):
     return {"message": "Session deleted", "session_id": session_id}
 
 
-# Message Endpoints (REST API alternative to Socket.IO)
-
 @router.post("/message/{collection_id}/{session_id}")
 async def send_message(
     collection_id: str,
     session_id: str,
-    req: SendMessageRequest
+    req: SendMessageRequest,
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Send a message and get AI response (REST API).
     For real-time updates, use Socket.IO instead.
     """
-    # Verify collection
     collection = await collection_store.get_collection_by_id(collection_id)
-    if not collection:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Collection not found"
-        )
-    
-    # Verify session
+    collection = _ensure_collection_owner(collection, _current_user_id(current_user))
+
     session = await collection_store.get_chat_session(collection_id, session_id)
     if not session:
         raise HTTPException(
@@ -139,8 +203,7 @@ async def send_message(
         )
     
     collection_name = collection.get('name')
-    
-    # Create and save user message
+    prior_messages = session.get("messages", [])
     user_message_id = str(uuid.uuid4())
     user_message = {
         "id": user_message_id,
@@ -152,34 +215,54 @@ async def send_message(
     await collection_store.add_message_to_session(collection_id, session_id, user_message)
     
     try:
-        # Get context from vector store
-        context = vector_store.get_context_for_question(
-            query=req.message,
-            top_k=req.top_k,
-            collection_name=collection_name
+        retrieval_query = _resolve_retrieval_query(req.message, prior_messages)
+        retrieval_top_k = max(req.top_k, 6)
+
+        context, sources = await asyncio.to_thread(
+            vector_store.get_context_and_sources,
+            retrieval_query,
+            retrieval_top_k,
+            collection_name,
+            0.4,
+        )
+        if not sources:
+            # Retry without threshold so we can still answer when embeddings are sparse.
+            context, sources = await asyncio.to_thread(
+                vector_store.get_context_and_sources,
+                retrieval_query,
+                retrieval_top_k,
+                collection_name,
+            )
+        history_for_llm = [
+            {"role": m.get("role"), "content": m.get("content", "")}
+            for m in prior_messages[-CHAT_HISTORY_LIMIT:]
+            if m.get("role") in {"user", "assistant"} and m.get("content")
+        ]
+        history_for_llm.append({"role": "user", "content": req.message})
+
+        answer = await asyncio.to_thread(
+            llm_service.chat_with_history,
+            messages=history_for_llm,
+            context=context,
+            system_prompt=(
+                f"{llm_service.DEFAULT_SYSTEM_PROMPT}\n\n"
+                "Use conversation history to resolve references like 'more info' or 'that'. "
+                "When asked for more information, add new details from context and avoid repeating prior text."
+            ),
         )
         
-        # Get source documents
-        sources = vector_store.search(
-            query=req.message,
-            top_k=req.top_k,
-            collection_name=collection_name
-        )
-        
-        # Generate AI response
-        answer = llm_service.generate_chat_response(
-            question=req.message,
-            context=context
-        )
-        
-        # Create and save assistant message
+
         assistant_message_id = str(uuid.uuid4())
         assistant_message = {
             "id": assistant_message_id,
             "role": "assistant",
             "content": answer,
             "sources": [
-                {"url": s["url"], "title": s["title"], "similarity": s["similarity"]}
+                {
+                    "url": s.get("url", ""),
+                    "title": s.get("title", ""),
+                    "similarity": s.get("similarity", 0.0),
+                }
                 for s in sources
             ],
             "created_at": datetime.utcnow().isoformat()
@@ -217,8 +300,15 @@ async def send_message(
 
 
 @router.get("/history/{collection_id}/{session_id}")
-async def get_chat_history(collection_id: str, session_id: str):
+async def get_chat_history(
+    collection_id: str,
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+):
     """Get full chat history for a session."""
+    collection = await collection_store.get_collection_by_id(collection_id)
+    _ensure_collection_owner(collection, _current_user_id(current_user))
+
     session = await collection_store.get_chat_session(collection_id, session_id)
     if not session:
         raise HTTPException(
@@ -230,4 +320,20 @@ async def get_chat_history(collection_id: str, session_id: str):
         "session_id": session_id,
         "collection_id": collection_id,
         "messages": session.get("messages", [])
+    }
+
+
+
+@router.get("/website/history/{session_id}")
+async def get_website_chat_history(session_id: str):
+    session = get_temp_website_session(session_id)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Website session not found",
+        )
+    return {
+        "session_id": session_id,
+        "url": session.get("url"),
+        "messages": session.get("messages", []),
     }
