@@ -1,7 +1,9 @@
 from datetime import datetime
+import asyncio
 import random
 import uuid
-from fastapi import APIRouter, HTTPException, status
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app import collection_store
 from app import llm_service
@@ -14,16 +16,33 @@ from app.models.quiz import (
     QuizQuestionPublic,
     WrongQuestionFeedback,
 )
+from app.auth import get_current_user
 
 router = APIRouter(prefix="/quizzes", tags=["quizzes"])
 
 
+def _current_user_id(current_user: dict) -> str:
+    return str(current_user["_id"])
+
+
+def _ensure_quiz_session_owner(session: Optional[dict], user_id: str) -> dict:
+    # 404 rather than 403 so session ids belonging to other users aren't confirmed.
+    if not session or session.get("user_id") != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quiz session not found",
+        )
+    return session
+
+
 @router.get("/collections")
-async def list_quiz_ready_collections():
+async def list_quiz_ready_collections(current_user: dict = Depends(get_current_user)):
     """
-    List collections that currently have enough MCQ questions to run a quiz.
+    List the authenticated user's collections that have enough MCQ questions to run a quiz.
     """
-    collections = await collection_store.get_all_collections(limit=200)
+    collections = await collection_store.get_all_collections(
+        _current_user_id(current_user), limit=200
+    )
     result = []
     for coll in collections:
         question_bank = await quiz_store.get_collection_mcq_bank(coll["id"])
@@ -39,12 +58,13 @@ async def list_quiz_ready_collections():
 
 
 @router.post("/start", response_model=QuizStartResponse, status_code=status.HTTP_201_CREATED)
-async def start_quiz(req: QuizStartRequest):
+async def start_quiz(req: QuizStartRequest, current_user: dict = Depends(get_current_user)):
     """
     Start a new quiz session for a selected collection.
     """
+    user_id = _current_user_id(current_user)
     collection = await collection_store.get_collection_by_id(req.collection_id)
-    if not collection:
+    if not collection or collection.get("user_id") != user_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Collection not found",
@@ -68,7 +88,9 @@ async def start_quiz(req: QuizStartRequest):
     )
 
     if req.scope_mode == "focused" and req.use_llm_classifier and req.focus_query:
-        labels = llm_service.classify_quiz_questions(filtered_bank, req.focus_query)
+        labels = await asyncio.to_thread(
+            llm_service.classify_quiz_questions, filtered_bank, req.focus_query
+        )
         filtered_bank = quiz_store.filter_core_topic_with_labels(filtered_bank, labels)
 
     if len(filtered_bank) < req.question_count:
@@ -87,7 +109,7 @@ async def start_quiz(req: QuizStartRequest):
     quiz_document = {
         "id": quiz_session_id,
         "collection_id": req.collection_id,
-        "user_id": req.user_id,
+        "user_id": user_id,
         "scope_mode": req.scope_mode,
         "focus_query": req.focus_query,
         "filters": {
@@ -127,16 +149,16 @@ async def start_quiz(req: QuizStartRequest):
 
 
 @router.post("/{quiz_session_id}/submit", response_model=QuizSubmitResponse)
-async def submit_quiz(quiz_session_id: str, req: QuizSubmitRequest):
+async def submit_quiz(
+    quiz_session_id: str,
+    req: QuizSubmitRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Submit answers for a quiz session, compute score, and get LLM guidance.
     """
     session = await quiz_store.get_quiz_session(quiz_session_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Quiz session not found",
-        )
+    session = _ensure_quiz_session_owner(session, _current_user_id(current_user))
 
     if session.get("status") == "completed":
         wrong_answers = [
@@ -198,7 +220,8 @@ async def submit_quiz(quiz_session_id: str, req: QuizSubmitRequest):
                 "explanation": question.get("explanation", ""),
             })
 
-    llm_suggestions = llm_service.generate_quiz_improvement_feedback(
+    llm_suggestions = await asyncio.to_thread(
+        llm_service.generate_quiz_improvement_feedback,
         score=score,
         total_questions=len(question_map),
         wrong_answers=wrong_answers,
@@ -230,15 +253,9 @@ async def submit_quiz(quiz_session_id: str, req: QuizSubmitRequest):
 
 
 @router.get("/{quiz_session_id}")
-async def get_quiz_session(quiz_session_id: str):
+async def get_quiz_session(quiz_session_id: str, current_user: dict = Depends(get_current_user)):
     """
     Get an existing quiz session, including score and suggestions if completed.
     """
     session = await quiz_store.get_quiz_session(quiz_session_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Quiz session not found",
-        )
-
-    return session
+    return _ensure_quiz_session_owner(session, _current_user_id(current_user))

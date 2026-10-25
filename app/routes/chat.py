@@ -14,6 +14,7 @@ from app import collection_store
 from app import vector_store
 from app import llm_service
 from app.auth import get_current_user
+from app.routes.scrape import get_temp_website_session
 
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -325,9 +326,9 @@ async def get_chat_history(
 
 
 @router.get("/website/history/{session_id}")
-async def get_website_chat_history(session_id: str):
+async def get_website_chat_history(session_id: str, current_user: dict = Depends(get_current_user)):
     session = get_temp_website_session(session_id)
-    if not session:
+    if not session or session.get("user_id") != _current_user_id(current_user):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Website session not found",

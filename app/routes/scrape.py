@@ -8,7 +8,9 @@ from typing import Any, Optional
 from urllib.parse import urlparse
 import uuid
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from app.auth import get_current_user
 
 from app.crawler import run_crawl
 from app.models import WebsiteChatMessage, WebsiteScrapePageRequest, WebsiteSession
@@ -95,7 +97,10 @@ def delete_temp_website_session(session_id: str) -> bool:
 
 
 @router.post("/page")
-async def scrape_page(payload: WebsiteScrapePageRequest):
+async def scrape_page(
+    payload: WebsiteScrapePageRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Scrape one page and optionally create an in-memory website chat session
     using the scraped context.
@@ -122,7 +127,7 @@ async def scrape_page(payload: WebsiteScrapePageRequest):
                 url=str(payload.url),
                 context=scraped_text,
                 website_session_name=payload.website_session_name,
-                user_id=payload.user_id,
+                user_id=str(current_user["_id"]),
             )
 
         return {
@@ -144,5 +149,7 @@ async def scrape_page(payload: WebsiteScrapePageRequest):
             ),
             "sources": [{"title": "Scraped Page", "url": str(payload.url)}],
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Scrape failed: {e}")

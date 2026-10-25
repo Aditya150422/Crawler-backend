@@ -206,15 +206,15 @@ async def create_collection(
     Create a new collection and start scraping the website.
     Returns both collection and job IDs for tracking.
     """
-    # Check if collection name already exists
-    existing = await collection_store.get_collection_by_name(req.name)
+    user_id = _current_user_id(current_user)
+
+    # Names only need to be unique per user
+    existing = await collection_store.get_collection_by_name(req.name, user_id=user_id)
     if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Collection '{req.name}' already exists"
         )
-    
-    user_id = _current_user_id(current_user)
 
     collection_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
@@ -325,7 +325,7 @@ async def get_collection_by_name(name: str, current_user: dict = Depends(get_cur
     if cached:
         return cached
 
-    collection = await collection_store.get_collection_by_name(name)
+    collection = await collection_store.get_collection_by_name(name, user_id=current_user_id)
     collection = _ensure_collection_owner(collection, current_user_id)
     await cache_set_json(cache_key, collection, ttl_seconds=60)
     return collection
@@ -497,7 +497,10 @@ async def get_collection_crawl_logs(
 
 
 @router.post("/learning-path", response_model=LearningPathResponse)
-async def generate_learning_path_from_urls(req: GenerateLearningPathRequest):
+async def generate_learning_path_from_urls(
+    req: GenerateLearningPathRequest,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Generate a structured learning path from a list of URLs.
     
@@ -522,7 +525,7 @@ async def generate_learning_path_from_urls(req: GenerateLearningPathRequest):
         )
     
     try:
-        result = generate_learning_path(req.urls)
+        result = await asyncio.to_thread(generate_learning_path, req.urls)
         return result
     except ValueError as e:
         raise HTTPException(
@@ -573,7 +576,7 @@ async def generate_learning_path_for_collection(
         )
     
     try:
-        result = generate_learning_path(routes_crawled)
+        result = await asyncio.to_thread(generate_learning_path, routes_crawled)
         await learning_node_summary_store.replace_collection_node_summaries(
             collection_id=collection_id,
             nodes=result.get("nodes", []),

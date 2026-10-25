@@ -49,7 +49,6 @@ class WebsiteSessionCreateRequest(BaseModel):
 class WebsiteScrapePageRequest(BaseModel):
     url: HttpUrl
     website_session_name: Optional[str] = None
-    user_id: Optional[str] = None
     create_session: bool = True
 
 

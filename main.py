@@ -1,19 +1,13 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, List
 from contextlib import asynccontextmanager
 import asyncio
 
-from app.crawler import crawl_sync
-from app import vector_store
 from app.database import connect_to_mongodb, close_mongodb_connection
 from app.redis_client import connect_redis, close_redis
-from app.routes import users_router, chat_router, collections_router, quizzes_router
+from app.routes import users_router, chat_router, collections_router, quizzes_router, scrape_router
 from app.socketio_manager import socket_app, sio, set_main_loop
 # from extension.main import app as extension_app
-
-import uuid
 
 
 @asynccontextmanager
@@ -23,7 +17,7 @@ async def lifespan(app: FastAPI):
     await connect_redis()
     
     # Capture the main event loop for background tasks
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     set_main_loop(loop)
     print(f"Main event loop captured for Socket.IO emissions")
     
@@ -54,6 +48,7 @@ app.include_router(users_router)
 app.include_router(chat_router)
 app.include_router(collections_router)
 app.include_router(quizzes_router)
+app.include_router(scrape_router)
 
 
 # Mount Socket.IO app at /socket.io path

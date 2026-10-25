@@ -646,7 +646,10 @@ async def run_crawl(
         By default, a list of dictionaries containing url, title, and text content.
         If include_report=True, returns a dictionary with pages and route-level crawl report.
     """
-    return _run_crawl_sync_internal(
+    # The crawl itself is synchronous; run it in a worker thread so the event loop
+    # (API requests and Socket.IO) keeps serving while it runs.
+    return await asyncio.to_thread(
+        _run_crawl_sync_internal,
         start_url,
         max_pages,
         max_depth,
