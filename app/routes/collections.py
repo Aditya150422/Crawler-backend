@@ -206,15 +206,17 @@ async def create_collection(
     Create a new collection and start scraping the website.
     Returns both collection and job IDs for tracking.
     """
-    user_id = _current_user_id(current_user)
-
-    # Names only need to be unique per user
-    existing = await collection_store.get_collection_by_name(req.name, user_id=user_id)
+    # Check if collection name already exists. Names stay globally unique because
+    # the Qdrant collection is keyed by name, so two users sharing a name would
+    # share (and could delete) each other's vectors.
+    existing = await collection_store.get_collection_by_name(req.name)
     if existing:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Collection '{req.name}' already exists"
         )
+    
+    user_id = _current_user_id(current_user)
 
     collection_id = str(uuid.uuid4())
     job_id = str(uuid.uuid4())
@@ -325,7 +327,7 @@ async def get_collection_by_name(name: str, current_user: dict = Depends(get_cur
     if cached:
         return cached
 
-    collection = await collection_store.get_collection_by_name(name, user_id=current_user_id)
+    collection = await collection_store.get_collection_by_name(name)
     collection = _ensure_collection_owner(collection, current_user_id)
     await cache_set_json(cache_key, collection, ttl_seconds=60)
     return collection

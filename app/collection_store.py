@@ -33,15 +33,12 @@ async def get_collection_by_id(collection_id: str) -> Optional[dict]:
     return None
 
 
-async def get_collection_by_name(name: str, user_id: Optional[str] = None) -> Optional[dict]:
-    """Get collection by name, optionally scoped to one user."""
+async def get_collection_by_name(name: str) -> Optional[dict]:
+    """Get collection by name."""
     from app.database import get_collection
     
     collections = get_collection("collections")
-    query = {"name": name}
-    if user_id:
-        query["user_id"] = user_id
-    collection = await collections.find_one(query)
+    collection = await collections.find_one({"name": name})
     
     if collection:
         collection.pop("_id", None)

@@ -108,14 +108,16 @@ async def scrape_page(
     try:
         results = await run_crawl(str(payload.url), max_pages=1)
         
-        # Extract text from the crawl results
-        if isinstance(results, list) and len(results) > 0:
-            raw = results[0]
-        elif isinstance(results, dict) and "pages" in results:
-            pages = results.get("pages", [])
-            raw = pages[0] if pages else {}
-        else:
+        # Extract text from the crawl results. The crawler puts robots.txt first
+        # when the site has one, so skip it and use the requested page.
+        pages = results.get("pages", []) if isinstance(results, dict) else results
+        pages = [
+            page for page in (pages or [])
+            if not (isinstance(page, dict) and str(page.get("url", "")).endswith("/robots.txt"))
+        ]
+        if not pages:
             raise RuntimeError("No content returned from scraping.")
+        raw = pages[0]
         
         scraped_text = extract_scraped_text(raw).strip()
         if not scraped_text:

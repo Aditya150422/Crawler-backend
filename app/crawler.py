@@ -452,7 +452,11 @@ def _run_crawl_sync_internal(
         ROBOTS_TIMEOUT_SECONDS,
     )
 
-    if robots_status == 200 and robots_text:
+    # Only enforce robots rules when robots.txt was actually fetched. An error
+    # response (e.g. a 404 page body) leaves the parser empty, and an unparsed
+    # RobotFileParser denies every URL.
+    robots_enforced = robots_status == 200 and bool(robots_text)
+    if robots_enforced:
         robots_parser.parse(robots_text.splitlines())
         robots_content = _normalize_text(robots_text)
         if robots_content:
@@ -516,7 +520,7 @@ def _run_crawl_sync_internal(
                 )
 
             try:
-                if robots_text and not robots_parser.can_fetch(browser_config.user_agent, current_url):
+                if robots_enforced and not robots_parser.can_fetch(browser_config.user_agent, current_url):
                     blocked_by_robots += 1
                     add_not_crawled(current_url, "blocked_by_robots_txt", "Blocked by robots.txt rules")
                     add_log("warning", "page_skipped", current_url, "Blocked by robots.txt rules", "blocked_by_robots_txt")
