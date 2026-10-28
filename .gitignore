@@ -3,6 +3,8 @@
 *.pyd
 __pycache__/
 # Environments
+.venv
+.venv/*
 .env
 venv/
 env/

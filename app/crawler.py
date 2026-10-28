@@ -1148,7 +1148,12 @@ def handle_chunk(chunk: str, metadata: Dict[str, Any], collection_id: str):
     """
     Handle a chunk of text and its metadata by generating a questionnaire.
     """
-    questionnaire = llm_service.generate_questionnaire_from_chunk(chunk)
+    try:
+        questionnaire = llm_service.generate_questionnaire_from_chunk(chunk)
+    except Exception as e:
+        # A failed LLM call (rate limit, timeout) should not abort the whole crawl.
+        print(f"Questionnaire generation failed for {metadata.get('url', '')}: {e}")
+        questionnaire = {"questions": []}
     chunk_store.save_chunk_questionnaire(
         collection_id=collection_id,
         questionnaire=questionnaire,

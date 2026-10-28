@@ -313,7 +313,8 @@ def classify_quiz_questions(
     questions: List[Dict[str, Any]],
     focus_query: str,
     model: str = None,
-    max_tokens: int = 1500,
+    # Room for reasoning-model tokens plus one label per question; truncated JSON drops every question.
+    max_tokens: int = 6000,
 ) -> Dict[str, str]:
     """
     Classify questions into core_topic or site_meta_noise relative to a focus query.
@@ -389,7 +390,8 @@ Rules:
 
     try:
         parsed = json.loads(response)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse quiz classifier JSON ({e}); response length {len(response)}")
         return {}
 
     labels: Dict[str, str] = {}
@@ -450,7 +452,9 @@ Instructions:
 def generate_questionnaire_from_chunk(
     chunk: str,
     model: str = None,
-    max_tokens: int = 600
+    # Reasoning models (e.g. gpt-oss) spend part of this budget on hidden reasoning;
+    # too low a cap truncates the JSON and yields zero questions.
+    max_tokens: int = 4000
 ) -> Dict[str, Any]:
     """
     Generate MCQ questionnaire for a single chunk of crawled data.
@@ -522,7 +526,8 @@ Rules:
 
     try:
         parsed = json.loads(response)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        print(f"Failed to parse chunk questionnaire JSON ({e}); response length {len(response)}")
         return {"questions": []}
 
     if not isinstance(parsed, dict) or not isinstance(parsed.get("questions"), list):
